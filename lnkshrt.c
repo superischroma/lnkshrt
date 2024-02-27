@@ -1,5 +1,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,10 +30,58 @@ bool crd_query_value_predicate(char c)
     return crd_query_name_predicate(c) || c == ' ';
 }
 
+bool crd_header_name_predicate(char c)
+{
+    return c == ':';
+}
+
+bool crd_header_value_predicate(char c)
+{
+    return c == '\r' || c == '\n';
+}
+
+bool string_end_predicate(char c)
+{
+    return c == '\0';
+}
+
+bool space_predicate(char c)
+{
+    return c == ' ';
+}
+
 unsigned empty_query_name_map(char* name)
 {
     return 0;
 }
+
+void create_shortened_link(char* destination, char* endpoint)
+{
+    char buffer[1024];
+    snprintf(buffer, 1024, "links/%s", endpoint);
+    FILE* file = fopen(buffer, "w");
+    fputs(destination, file);
+    fclose(file);
+}
+
+char* get_shortened_link_destination(char* endpoint)
+{
+    if (strlen(endpoint) <= 1)
+        return NULL;
+    char buffer[1024];
+    snprintf(buffer, 1024, "links%s", endpoint);
+    FILE* file = fopen(buffer, "r");
+    if (file == NULL)
+        return NULL;
+    int dest_len = fread(buffer, sizeof(char), 1024, file);
+    char* destination = malloc(dest_len + 1);
+    strncpy(destination, buffer, dest_len);
+    return destination;
+}
+
+#define malloc_const_response(str) \
+    resp->data = malloc(sizeof str); \
+    strcpy(resp->data, str);
 
 // GET /
 response_details_t* index_get_handler(request_details_t* rd)
@@ -54,6 +103,51 @@ response_details_t* stylesheet_get_handler(request_details_t* rd)
     return resp;
 }
 
+// GET /resources/script.js
+response_details_t* script_get_handler(request_details_t* rd)
+{
+    response_details_t* resp = calloc(1, sizeof *resp);
+    resp->mime = "text/javascript";
+    resp->code = "200 OK";
+    resp->data = read_entire_file("front/script.js");
+    return resp;
+}
+
+// 404 handler
+response_details_t* not_found_handler(request_details_t* rd)
+{
+    response_details_t* resp = calloc(1, sizeof *resp);
+    resp->mime = "text/plain";
+    resp->code = "404 Not Found";
+    malloc_const_response("The requested resource could not be found on this server.");
+    return resp;
+}
+
+// POST /api/shorten
+response_details_t* shorten_post_handler(request_details_t* rd)
+{
+    response_details_t* resp = calloc(1, sizeof *resp);
+    char* body = rd->body;
+    resp->mime = "text/plain";
+    unsigned dest_len = 0;
+    char* destination = copy_until(body, &dest_len, space_predicate);
+    if (!rd->body[dest_len]) // only found destination, no endpoint
+    {
+        resp->code = "400 Bad Request";
+        malloc_const_response("No endpoint provided.");
+        return resp;
+    }
+    body += dest_len + 1;
+    unsigned endpoint_len = 0;
+    char* endpoint = copy_until(body, &endpoint_len, string_end_predicate);
+    create_shortened_link(destination, endpoint);
+    free(destination);
+    free(endpoint);
+    resp->code = "201 Created";
+    malloc_const_response("Success.");
+    return resp;
+}
+
 void* find_request_handler(request_details_t* rd)
 {
     if (rd->method == METHOD_GET)
@@ -62,18 +156,23 @@ void* find_request_handler(request_details_t* rd)
             return index_get_handler;
         if (!strcmp(rd->endpoint, "/resources/style.css"))
             return stylesheet_get_handler;
+        if (!strcmp(rd->endpoint, "/resources/script.js"))
+            return script_get_handler;
     }
-    return NULL;
+    if (rd->method == METHOD_POST)
+    {
+        if (!strcmp(rd->endpoint, "/api/shorten"))
+            return shorten_post_handler;
+    }
+    return not_found_handler;
 }
 
-void* find_query_name_map(request_details_t* rd)
-{
-    if (!strcmp(rd->endpoint, "/") ||
-        !strcmp(rd->endpoint, "/resources/style.css"))
-        return empty_query_name_map;
-    return NULL;
-}
-
+// raw_req should be a raw HTTP request string like:
+// <method> <endpoint>[query] HTTP/1.1
+// <header-name>: <header-value>
+// ...
+//
+// [body]
 char* construct_request_details(request_details_t* rd, char* raw_req)
 {
     if (!nstrcmp(raw_req, "GET", 3))
@@ -82,13 +181,12 @@ char* construct_request_details(request_details_t* rd, char* raw_req)
         rd->method = METHOD_POST;
 
     for (; *raw_req != ' '; ++raw_req); // jump to right before the endpoint
-    ++raw_req;
+    ++raw_req; // go the endpoint
     unsigned endpoint_len = 0;
     char* endpoint = rd->endpoint = copy_until(raw_req, &endpoint_len, crd_endpoint_predicate);
     raw_req += endpoint_len;
-    rd->query = calloc(QUERY_BUFFER_SIZE, sizeof(char*));
-    for (unsigned i = 0; i < 16; ++i)
-        rd->query[i] = NULL;
+    rd->query = map_init();
+    rd->headers = map_init();
     if (*raw_req == '?')
     {
         while (*(raw_req++) != ' ')
@@ -96,20 +194,38 @@ char* construct_request_details(request_details_t* rd, char* raw_req)
             unsigned query_name_len = 0;
             char* query_name = copy_until(raw_req, &query_name_len, crd_query_name_predicate);
             raw_req += query_name_len;
-            unsigned (*query_name_map)(char*) = find_query_name_map(rd);
-            unsigned query_index = query_name_map(query_name);
-            free(query_name);
-            if (*(raw_req++) == '&')
+            if (*raw_req == '&')
             {
-                rd->query[query_index] = "true";
+                map_put(rd->query, query_name, "true");
                 continue;
             }
+            ++raw_req;
             unsigned query_value_len = 0;
             char* query_value = copy_until(raw_req, &query_value_len, crd_query_value_predicate);
             raw_req += query_value_len;
-            rd->query[query_index] = query_value;
+            map_put(rd->query, query_name, query_value);
         }
     }
+    for (; *raw_req != '\n'; ++raw_req); // jump after the HTTP/1.1
+    ++raw_req; // jump past the newline
+    while (*raw_req != '\r' && *raw_req != '\n')
+    {
+        unsigned header_name_len = 0;
+        char* header_name = copy_until(raw_req, &header_name_len, crd_header_name_predicate);
+        raw_req += header_name_len + 2;
+        unsigned header_value_len = 0;
+        char* header_value = copy_until(raw_req, &header_value_len, crd_header_value_predicate);
+        raw_req += header_value_len;
+        if (*raw_req == '\r')
+            ++raw_req;
+        ++raw_req;
+        map_put(rd->headers, header_name, header_value);
+    }
+    if (*raw_req == '\r')
+        ++raw_req;
+    ++raw_req;
+    unsigned body_len = 0;
+    rd->body = copy_until(raw_req, &body_len, string_end_predicate);
     return raw_req;
 }
 
@@ -117,9 +233,9 @@ char* construct_request_details(request_details_t* rd, char* raw_req)
 void free_request_details(request_details_t* rd)
 {
     free(rd->endpoint);
-    for (unsigned i = 0; i < 16; ++i)
-        free(rd->query[i]);
-    free(rd->query);
+    map_deep_free(rd->query);
+    map_deep_free(rd->headers);
+    free(rd->body);
     free(rd);
 }
 
@@ -139,16 +255,27 @@ void* handle_client(void* arg)
 
     if (bytes_received > 0)
     {
+        printf("%.*s\n", bytes_received, buffer_start);
         request_details_t* rd = calloc(1, sizeof *rd);
         buffer = construct_request_details(rd, buffer);
         printf("%d, %s\n", rd->method, rd->endpoint);
-        response_details_t* (*handler)(request_details_t*) = find_request_handler(rd);
-        response_details_t* resp = handler(rd);
+        char* destination = get_shortened_link_destination(rd->endpoint);
         char* resp_buffer = malloc(BUFFER_SIZE);
-        int resp_len = snprintf(resp_buffer, BUFFER_SIZE, "HTTP/1.1 %s\r\nContent-Type: %s\r\n\r\n%s", resp->code, resp->mime, resp->data);
-        send(client_fd, resp_buffer, resp_len, 0);
+        if (destination)
+        {
+            int resp_len = snprintf(resp_buffer, BUFFER_SIZE, "HTTP/1.1 301 Moved Permanently\r\nLocation: %s", destination);
+            send(client_fd, resp_buffer, resp_len, 0);
+            free(destination);
+        }
+        else
+        {
+            response_details_t* (*handler)(request_details_t*) = find_request_handler(rd);
+            response_details_t* resp = handler(rd);
+            int resp_len = snprintf(resp_buffer, BUFFER_SIZE, "HTTP/1.1 %s\r\nContent-Type: %s\r\n\r\n%s", resp->code, resp->mime, resp->data);
+            send(client_fd, resp_buffer, resp_len, 0);
+            free_response_details(resp);
+        }
         free(resp_buffer);
-        free_response_details(resp);
         free_request_details(rd);
     }
 

@@ -18,6 +18,7 @@ int nstrcmp(char* s1, char* s2, int n)
 
 char* copy_until(char* str, unsigned* copied, bool (*predicate)(char)) 
 {
+    *copied = 0;
     for (char* s = str; !predicate(*s) && *s; ++s, ++(*copied));
     char* substr = malloc(*copied + 1);
     substr[*copied] = '\0';
@@ -35,4 +36,13 @@ char* read_entire_file(char* filename)
     char* buffer = malloc(fsize);
     read(file_fd, buffer, fsize);
     return buffer;
+}
+
+int fngets(char* buffer, int n, FILE* file)
+{
+    int written = 0;
+    for (int c = fgetc(file); c != EOF && written < n; ++written, c = fgetc(file))
+        buffer[written] = c;
+    buffer[written == n ? written - 1 : written++] = '\0';
+    return written;
 }
